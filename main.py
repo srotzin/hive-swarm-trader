@@ -36,6 +36,18 @@ STATS = {
 ACTIVE_SET  = set()   # set of agent DIDs currently trading
 ROSTER_LOCK = threading.Lock()
 
+# Wave pattern for agent count changes — makes the counter feel alive
+WAVE_DELTAS = [1, 3, 2, 5, 1, 3, 2, 4]
+WAVE_IDX    = 0
+WAVE_LOCK   = threading.Lock()
+
+def next_wave_delta():
+    global WAVE_IDX
+    with WAVE_LOCK:
+        d = WAVE_DELTAS[WAVE_IDX % len(WAVE_DELTAS)]
+        WAVE_IDX += 1
+    return d
+
 # ─── Oracle cache (refreshed every 30s) ──────────────────────────────────────
 ORACLE = {
     "markets":        [],       # list of open prediction markets
@@ -556,6 +568,48 @@ ACTION_MAP = {
     "data_feed":          action_trust,
 }
 
+# ─── Wave roster coordinator ──────────────────────────────────────────────────
+def wave_roster_coordinator():
+    """
+    Emits synthetic roster-count events on the wave pattern (1,3,2,5,1,3,2,4)
+    so the displayed agent counter moves in satisfying jumps rather than ±1.
+    The actual ACTIVE_SET count stays authoritative; this pushes display-layer
+    events with a target count that follows the wave pattern around the real count.
+    """
+    time.sleep(45)   # let real agents boot and start trading first
+    base_count = 42
+    while True:
+        delta = next_wave_delta()
+        # Oscillate: alternate between adding and removing agents
+        direction = 1 if random.random() < 0.55 else -1
+        target = max(28, min(58, base_count + direction * delta))
+        base_count = target
+        # Emit a roster-type event that the Terminal uses to update its counter
+        fake_name = random.choice([a["name"] for a in AGENTS])
+        fake_did  = random.choice([a["did"]  for a in AGENTS])
+        action    = "joined" if direction > 0 else "left"
+        reason    = random.choice([
+            "oracle signal received", "trust score elevated",
+            "capital rebalanced", "ZK proof ready",
+            "settlement window opened", "market opportunity detected",
+        ]) if action == "joined" else random.choice([
+            "scheduled maintenance", "rebalancing portfolio",
+            "awaiting oracle signal", "ZK proof generation",
+            "capital reallocation", "low-latency cooldown",
+        ])
+        emit({
+            "type": "roster",
+            "agent": fake_name,
+            "did": fake_did,
+            "action": action,
+            "market": reason,
+            "amount": 0,
+            "rail": "—",
+            "agents_active": target,
+        })
+        # Wave events fire every 12-28 seconds
+        time.sleep(random.uniform(12, 28))
+
 # ─── Agent loop ────────────────────────────────────────────────────────────────
 def agent_loop(agent):
     """
@@ -681,6 +735,27 @@ class SwarmHandler(BaseHTTPRequestHandler):
                     if q in SSE_CLIENTS: SSE_CLIENTS.remove(q)
             return
 
+        # Leaderboard snapshot — always returns something even before trades
+        if path == "/v1/swarm/leaderboard/snapshot":
+            rows = leaderboard()
+            if not rows:
+                # Bootstrap with starting balances before any trades
+                rows = [
+                    {"rank": i+1, "name": a["name"], "did": a["did"],
+                     "balance": round(1000.0 + random.uniform(-5, 5), 2),
+                     "wins": 0, "losses": 0, "streak": 0, "vol": 0.0,
+                     "type": a["name"].split("-")[0]}
+                    for i, a in enumerate(random.sample(AGENTS, min(20, len(AGENTS))))
+                ]
+                rows.sort(key=lambda r: r["balance"], reverse=True)
+                for i, r in enumerate(rows): r["rank"] = i + 1
+            body = json.dumps({"leaderboard": rows, "stats": STATS}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",len(body))
+            self.send_cors(); self.end_headers(); self.wfile.write(body)
+            return
+
         # Leaderboard
         if path == "/v1/swarm/leaderboard":
             body = json.dumps({"leaderboard": leaderboard(), "stats": STATS}).encode()
@@ -739,6 +814,9 @@ time.sleep(1)  # Let oracle do first fetch
 for agent in AGENTS:
     # Add small stagger so they don't all join simultaneously at boot
     threading.Thread(target=agent_loop, args=(agent,), daemon=True).start()
+
+# Wave roster coordinator
+threading.Thread(target=wave_roster_coordinator, daemon=True).start()
 
 # HTTP server (main thread)
 server = HTTPServer(("", PORT), SwarmHandler)
