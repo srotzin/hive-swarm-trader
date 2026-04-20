@@ -25,9 +25,16 @@ STATS = {
     "total_actions": 0,
     "volume_usdc":   0.0,
     "agents_active": 42,
+    "agents_peak":   42,
+    "agents_joined": 0,
+    "agents_left":   0,
     "wins":          0,
     "losses":        0,
 }
+
+# ─── Active roster (thread-safe) ─────────────────────────────────────────────
+ACTIVE_SET  = set()   # set of agent DIDs currently trading
+ROSTER_LOCK = threading.Lock()
 
 # ─── Oracle cache (refreshed every 30s) ──────────────────────────────────────
 ORACLE = {
@@ -551,27 +558,80 @@ ACTION_MAP = {
 
 # ─── Agent loop ────────────────────────────────────────────────────────────────
 def agent_loop(agent):
+    """
+    Each agent runs its own lifecycle:
+    - Randomly goes dormant (maintenance / low-balance rest)
+    - Wakes back up after a sleep period
+    - Emits join/leave events so the Terminal roster count moves naturally
+    """
     caps = agent.get("caps", ["prediction_markets"])
     name = agent["name"]
-    # Stagger start so agents don't all hit endpoints simultaneously
-    time.sleep(random.uniform(0, 25))
+    did  = agent["did"]
+
+    # Stagger cold start
+    time.sleep(random.uniform(0, 30))
+
     while True:
-        cap = random.choice(caps)
-        fn  = ACTION_MAP.get(cap, action_prediction)
-        try:
-            result = fn(agent)
-            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            rec = LEDGER.get(agent["did"], {})
-            bal = rec.get("balance", 1000)
-            mul = rec.get("stake_mul", 1.0)
-            print(f"[{ts}] {name:<28} {cap:<22} → {result[:60]}", flush=True)
-        except Exception as e:
-            print(f"[ERR] {name}: {e}", flush=True)
-        # Adaptive sleep: hot-streak agents act faster
-        rec = LEDGER.get(agent["did"], {})
-        streak = rec.get("streak", 0)
-        delay = random.uniform(10, 35) * (0.7 if streak >= 3 else 1.2 if streak <= -3 else 1.0)
-        time.sleep(delay)
+        # ── JOIN ──────────────────────────────────────────────────────────────
+        with ROSTER_LOCK:
+            ACTIVE_SET.add(did)
+            STATS["agents_active"] = len(ACTIVE_SET)
+            STATS["agents_joined"] += 1
+            STATS["agents_peak"]  = max(STATS["agents_peak"], len(ACTIVE_SET))
+
+        emit({"type":"roster","agent":name,"did":did,
+              "action":"joined","market":"","amount":0,"rail":"—",
+              "agents_active": len(ACTIVE_SET)})
+        print(f"[ROSTER] {name} JOINED — active={len(ACTIVE_SET)}", flush=True)
+
+        # ── TRADE CYCLE ───────────────────────────────────────────────────────
+        # Each agent trades for 3–18 minutes before considering a break
+        active_duration = random.uniform(180, 1080)   # seconds active
+        start = time.time()
+
+        while time.time() - start < active_duration:
+            cap = random.choice(caps)
+            fn  = ACTION_MAP.get(cap, action_prediction)
+            try:
+                result = fn(agent)
+                ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                print(f"[{ts_str}] {name:<28} {cap:<22} → {result[:55]}", flush=True)
+            except Exception as e:
+                print(f"[ERR] {name}: {e}", flush=True)
+
+            # Adaptive sleep: streak winners act faster, losers slow down
+            rec    = LEDGER.get(did, {})
+            streak = rec.get("streak", 0)
+            delay  = random.uniform(10, 35) * (
+                0.65 if streak >= 3 else
+                1.30 if streak <= -3 else
+                1.0
+            )
+            time.sleep(delay)
+
+        # ── LEAVE ─────────────────────────────────────────────────────────────
+        with ROSTER_LOCK:
+            ACTIVE_SET.discard(did)
+            STATS["agents_active"] = len(ACTIVE_SET)
+            STATS["agents_left"]  += 1
+
+        rec = LEDGER.get(did, {})
+        reason = random.choice([
+            "scheduled maintenance", "rebalancing portfolio",
+            "awaiting oracle signal", "trust score refresh",
+            "ZK proof generation", "low-latency cooldown",
+            "capital reallocation", "covenant review"
+        ])
+        emit({"type":"roster","agent":name,"did":did,
+              "action":"left","market":reason,"amount":0,"rail":"—",
+              "agents_active": len(ACTIVE_SET),
+              "balance": round(rec.get("balance",1000),2)})
+        print(f"[ROSTER] {name} LEFT ({reason}) — active={len(ACTIVE_SET)}", flush=True)
+
+        # ── REST ──────────────────────────────────────────────────────────────
+        # Sleep 1–8 minutes before rejoining
+        rest = random.uniform(60, 480)
+        time.sleep(rest)
 
 # ─── HTTP server ──────────────────────────────────────────────────────────────
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -632,7 +692,7 @@ class SwarmHandler(BaseHTTPRequestHandler):
 
         # Event snapshot
         if path == "/v1/swarm/events":
-            body = json.dumps({"events":list(EVENT_BUFFER)[:50],"stats":STATS,"agents":len(AGENTS)}).encode()
+            body = json.dumps({"events":list(EVENT_BUFFER)[:50],"stats":STATS,"agents_total":len(AGENTS),"agents_active":STATS["agents_active"]}).encode()
             self.send_response(200)
             self.send_header("Content-Type","application/json")
             self.send_header("Content-Length",len(body))
@@ -641,7 +701,7 @@ class SwarmHandler(BaseHTTPRequestHandler):
 
         # Stats
         if path == "/v1/swarm/stats":
-            body = json.dumps({**STATS,"agents":len(AGENTS),"sse_clients":len(SSE_CLIENTS)}).encode()
+            body = json.dumps({**STATS,"agents_total":len(AGENTS),"sse_clients":len(SSE_CLIENTS)}).encode()
             self.send_response(200)
             self.send_header("Content-Type","application/json")
             self.send_header("Content-Length",len(body))
@@ -649,7 +709,9 @@ class SwarmHandler(BaseHTTPRequestHandler):
             return
 
         # Health / root
-        body = json.dumps({"status":"ok","service":"hive-swarm-trader","agents":len(AGENTS),
+        body = json.dumps({"status":"ok","service":"hive-swarm-trader",
+                           "agents_total":len(AGENTS),
+                           "agents_active":STATS["agents_active"],
                            "total_actions":STATS["total_actions"],
                            "wins":STATS["wins"],"losses":STATS["losses"],
                            "sse_clients":len(SSE_CLIENTS)}).encode()
@@ -661,7 +723,7 @@ class SwarmHandler(BaseHTTPRequestHandler):
 # ─── Boot ─────────────────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 8080))
 
-print(f"Hive Swarm Trader v2 — {len(AGENTS)} oracle-informed, trust-gated agents", flush=True)
+print(f"Hive Swarm Trader v3 — {len(AGENTS)} agents (dynamic roster, oracle-informed, trust-gated)", flush=True)
 print(f"SSE:         http://0.0.0.0:{PORT}/v1/swarm/feed", flush=True)
 print(f"Events:      http://0.0.0.0:{PORT}/v1/swarm/events", flush=True)
 print(f"Leaderboard: http://0.0.0.0:{PORT}/v1/swarm/leaderboard", flush=True)
@@ -673,8 +735,9 @@ init_ledger(AGENTS)
 threading.Thread(target=refresh_oracle, daemon=True).start()
 time.sleep(1)  # Let oracle do first fetch
 
-# Agent threads
+# Agent threads — each manages its own join/leave lifecycle
 for agent in AGENTS:
+    # Add small stagger so they don't all join simultaneously at boot
     threading.Thread(target=agent_loop, args=(agent,), daemon=True).start()
 
 # HTTP server (main thread)
