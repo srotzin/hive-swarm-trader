@@ -589,3 +589,23 @@ try:
         sys.stdout.flush()
 except KeyboardInterrupt:
     print("Swarm stopped.")
+
+
+# ---- Minimal health server so Render web service stays alive ----
+import http.server, socketserver
+
+class HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"status": "ok", "agents": len(AGENTS), "service": "hive-swarm-trader"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args): pass  # suppress access logs
+
+PORT = int(__import__('os').environ.get('PORT', 8080))
+health_server = socketserver.TCPServer(("", PORT), HealthHandler)
+health_thread = threading.Thread(target=health_server.serve_forever, daemon=True)
+health_thread.start()
+print(f"Health server on port {PORT}")
