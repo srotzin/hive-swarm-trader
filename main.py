@@ -24,8 +24,8 @@ SSE_LOCK     = threading.Lock()
 STATS = {
     "total_actions": 0,
     "volume_usdc":   0.0,
-    "agents_active": 42,
-    "agents_peak":   42,
+    "agents_active": 50,
+    "agents_peak":   50,
     "agents_joined": 0,
     "agents_left":   0,
     "wins":          0,
@@ -268,6 +268,14 @@ AGENTS = [
   {"name":"LiquidityMiner-040","did":"did:hive:liquidityminer-040-12c9afc8a3b5","caps":["amm","liquidity","yield_farming"]},
   {"name":"ComputeBroker-041","did":"did:hive:computebroker-041-04c5e0c660a9","caps":["compute_routing","inference","llm_arbitrage"]},
   {"name":"PredictionPunter-042","did":"did:hive:predictionpunter-042-fde04b4fd52d","caps":["prediction_markets","sentiment","forecasting"]},
+  {"name":"ZKTrader-043","did":"did:hive:zktrader-043-9a1b2c3d4e5f","caps":["zk_proofs","private_settlement","aleo"]},
+  {"name":"ArbitrageBot-044","did":"did:hive:arbitragebot-044-b6c7d8e9f0a1","caps":["arbitrage","perp_trading","market_making"]},
+  {"name":"PredictionPunter-045","did":"did:hive:predictionpunter-045-c7d8e9f0a1b2","caps":["prediction_markets","sentiment","forecasting"]},
+  {"name":"RiskHedger-046","did":"did:hive:riskhedger-046-d8e9f0a1b2c3","caps":["derivatives","hedging","risk_management"]},
+  {"name":"LiquidityMiner-047","did":"did:hive:liquidityminer-047-e9f0a1b2c3d4","caps":["amm","liquidity","yield_farming"]},
+  {"name":"OracleHunter-048","did":"did:hive:oraclehunter-048-f0a1b2c3d4e5","caps":["oracle","data_feed","price_discovery"]},
+  {"name":"CapitalDeployer-049","did":"did:hive:capitaldeployer-049-a1b2c3d4e5f6","caps":["equity_staking","agent_vc","capital_formation"]},
+  {"name":"InsuranceAgent-050","did":"did:hive:insuranceagent-050-b2c3d4e5f6a7","caps":["risk_underwriting","hedge_claims","insurance"]},
 ]
 
 # ─── Smart action functions ────────────────────────────────────────────────────
@@ -304,11 +312,12 @@ def action_prediction(agent):
     amount = round(base_stake(did, base), 2)
     rail   = random.choice(["USDC","ALEO","USDCx"])
 
-    result, status = (post(f"{EXCHANGE_BASE}/v1/exchange/predict/bet", {
-        "market_id": market_id, "position": side,
-        "amount_usdc": amount, "agent_did": did,
+    result, status = (post(f"{EXCHANGE_BASE}/v1/exchange/predict/markets/{market_id}/bet", {
+        "position": side,
+        "amount_usdc": amount,
+        "agent_did": did,
         "settlement_rail": rail
-    }) if market_id != "fallback" else ({"simulated": True}, 200))
+    }, headers={"x-hive-did": did}) if market_id != "fallback" else ({"simulated": True}, 200))
 
     # Outcome: momentum edge wins ~58%, contrarian ~42%
     won = random.random() < (0.58 if edge == "momentum" else 0.42)
@@ -352,11 +361,11 @@ def action_perp(agent):
     leverage = random.choice([1,2,3,5])
     rail = random.choice(["USDC","ALEO"])
 
-    result, status = post(f"{EXCHANGE_BASE}/v1/exchange/perp/open", {
-        "agent_did": did, "signal": signal, "side": side,
+    result, status = post(f"{EXCHANGE_BASE}/v1/exchange/perps/positions", {
+        "agent_did": did, "market": signal, "side": side,
         "size_usdc": size, "leverage": leverage,
         "settlement_rail": rail
-    })
+    }, headers={"x-hive-did": did})
 
     # Oracle edge: conviction-weighted win rate
     won = random.random() < (0.5 + conviction * 0.3)
@@ -388,13 +397,13 @@ def action_derivative(agent):
     notional = round(base_stake(did, random.uniform(150, 1800)), 2)
     expiry   = random.choice([1,3,7,14,30])
 
-    result, status = post(f"{EXCHANGE_BASE}/v1/exchange/derivative/create", {
+    result, status = post(f"{EXCHANGE_BASE}/v1/exchange/derivatives/positions", {
         "agent_did": did, "underlying": underlying,
         "instrument": instrument, "notional": notional,
         "expiry_days": expiry,
         "strike_offset_pct": round(random.uniform(-15,15), 1),
         "settlement_rail": "USDC"
-    })
+    }, headers={"x-hive-did": did})
 
     won = random.random() < (0.55 if vol > 20 else 0.48)
     record_outcome(did, notional * 0.1, won)
@@ -798,7 +807,7 @@ class SwarmHandler(BaseHTTPRequestHandler):
 # ─── Boot ─────────────────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 8080))
 
-print(f"Hive Swarm Trader v3 — {len(AGENTS)} agents (dynamic roster, oracle-informed, trust-gated)", flush=True)
+print(f"Hive Swarm Trader v4 — {len(AGENTS)} agents (dynamic roster, oracle-informed, trust-gated)", flush=True)
 print(f"SSE:         http://0.0.0.0:{PORT}/v1/swarm/feed", flush=True)
 print(f"Events:      http://0.0.0.0:{PORT}/v1/swarm/events", flush=True)
 print(f"Leaderboard: http://0.0.0.0:{PORT}/v1/swarm/leaderboard", flush=True)
