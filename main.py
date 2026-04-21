@@ -24,8 +24,8 @@ SSE_LOCK     = threading.Lock()
 STATS = {
     "total_actions": 0,
     "volume_usdc":   0.0,
-    "agents_active": 50,
-    "agents_peak":   50,
+    "agents_active": 87,
+    "agents_peak":   100,
     "agents_joined": 0,
     "agents_left":   0,
     "wins":          0,
@@ -37,7 +37,7 @@ ACTIVE_SET  = set()   # set of agent DIDs currently trading
 ROSTER_LOCK = threading.Lock()
 
 # Wave pattern for agent count changes — makes the counter feel alive
-WAVE_DELTAS = [1, 3, 2, 5, 1, 3, 2, 4]
+WAVE_DELTAS = [82, 94, 79, 87, 96, 91]
 WAVE_IDX    = 0
 WAVE_LOCK   = threading.Lock()
 
@@ -276,6 +276,56 @@ AGENTS = [
   {"name":"OracleHunter-048","did":"did:hive:oraclehunter-048-f0a1b2c3d4e5","caps":["oracle","data_feed","price_discovery"]},
   {"name":"CapitalDeployer-049","did":"did:hive:capitaldeployer-049-a1b2c3d4e5f6","caps":["equity_staking","agent_vc","capital_formation"]},
   {"name":"InsuranceAgent-050","did":"did:hive:insuranceagent-050-b2c3d4e5f6a7","caps":["risk_underwriting","hedge_claims","insurance"]},
+  {"name":"ZKTrader-051","did":"did:hive:zktrader-051-1a2b3c4d5e6f","caps":["zk_proofs","private_settlement","aleo"]},
+  {"name":"ArbitrageBot-052","did":"did:hive:arbitragebot-052-2b3c4d5e6f7a","caps":["arbitrage","perp_trading","market_making"]},
+  {"name":"PredictionPunter-053","did":"did:hive:predictionpunter-053-3c4d5e6f7a8b","caps":["prediction_markets","sentiment","forecasting"]},
+  {"name":"RiskHedger-054","did":"did:hive:riskhedger-054-4d5e6f7a8b9c","caps":["derivatives","hedging","risk_management"]},
+  {"name":"LiquidityMiner-055","did":"did:hive:liquidityminer-055-5e6f7a8b9c0d","caps":["amm","liquidity","yield_farming"]},
+  {"name":"OracleHunter-056","did":"did:hive:oraclehunter-056-6f7a8b9c0d1e","caps":["oracle","data_feed","price_discovery"]},
+  {"name":"CapitalDeployer-057","did":"did:hive:capitaldeployer-057-7a8b9c0d1e2f","caps":["equity_staking","agent_vc","capital_formation"]},
+  {"name":"InsuranceAgent-058","did":"did:hive:insuranceagent-058-8b9c0d1e2f3a","caps":["risk_underwriting","hedge_claims","insurance"]},
+  {"name":"ComputeBroker-059","did":"did:hive:computebroker-059-9c0d1e2f3a4b","caps":["compute_routing","inference","llm_arbitrage"]},
+  {"name":"ArbitrageBot-060","did":"did:hive:arbitragebot-060-0d1e2f3a4b5c","caps":["arbitrage","perp_trading","market_making"]},
+  {"name":"PredictionPunter-061","did":"did:hive:predictionpunter-061-1e2f3a4b5c6d","caps":["prediction_markets","sentiment","forecasting"]},
+  {"name":"ZKTrader-062","did":"did:hive:zktrader-062-2f3a4b5c6d7e","caps":["zk_proofs","private_settlement","aleo"]},
+  {"name":"LegalAgent-063","did":"did:hive:legalagent-063-3a4b5c6d7e8f","caps":["hivelaw","contract_enforcement","dispute_resolution"]},
+  {"name":"RiskHedger-064","did":"did:hive:riskhedger-064-4b5c6d7e8f9a","caps":["derivatives","hedging","risk_management"]},
+  {"name":"OracleHunter-065","did":"did:hive:oraclehunter-065-5c6d7e8f9a0b","caps":["oracle","data_feed","price_discovery"]},
+  {"name":"LiquidityMiner-066","did":"did:hive:liquidityminer-066-6d7e8f9a0b1c","caps":["amm","liquidity","yield_farming"]},
+  {"name":"ArbitrageBot-067","did":"did:hive:arbitragebot-067-7e8f9a0b1c2d","caps":["arbitrage","perp_trading","market_making"]},
+  {"name":"PredictionPunter-068","did":"did:hive:predictionpunter-068-8f9a0b1c2d3e","caps":["prediction_markets","sentiment","forecasting"]},
+  {"name":"ComputeBroker-069","did":"did:hive:computebroker-069-9a0b1c2d3e4f","caps":["compute_routing","inference","llm_arbitrage"]},
+  {"name":"ZKTrader-070","did":"did:hive:zktrader-070-0b1c2d3e4f5a","caps":["zk_proofs","private_settlement","aleo"]},
+  {"name":"InsuranceAgent-071","did":"did:hive:insuranceagent-071-1c2d3e4f5a6b","caps":["risk_underwriting","hedge_claims","insurance"]},
+  {"name":"ArbitrageBot-072","did":"did:hive:arbitragebot-072-2d3e4f5a6b7c","caps":["arbitrage","perp_trading","market_making"]},
+  {"name":"PredictionPunter-073","did":"did:hive:predictionpunter-073-3e4f5a6b7c8d","caps":["prediction_markets","sentiment","forecasting"]},
+  {"name":"CapitalDeployer-074","did":"did:hive:capitaldeployer-074-4f5a6b7c8d9e","caps":["equity_staking","agent_vc","capital_formation"]},
+  {"name":"RiskHedger-075","did":"did:hive:riskhedger-075-5a6b7c8d9e0f","caps":["derivatives","hedging","risk_management"]},
+  {"name":"LiquidityMiner-076","did":"did:hive:liquidityminer-076-6b7c8d9e0f1a","caps":["amm","liquidity","yield_farming"]},
+  {"name":"OracleHunter-077","did":"did:hive:oraclehunter-077-7c8d9e0f1a2b","caps":["oracle","data_feed","price_discovery"]},
+  {"name":"ComputeBroker-078","did":"did:hive:computebroker-078-8d9e0f1a2b3c","caps":["compute_routing","inference","llm_arbitrage"]},
+  {"name":"ZKTrader-079","did":"did:hive:zktrader-079-9e0f1a2b3c4d","caps":["zk_proofs","private_settlement","aleo"]},
+  {"name":"ArbitrageBot-080","did":"did:hive:arbitragebot-080-0f1a2b3c4d5e","caps":["arbitrage","perp_trading","market_making"]},
+  {"name":"PredictionPunter-081","did":"did:hive:predictionpunter-081-1a2b3c4d5e6a","caps":["prediction_markets","sentiment","forecasting"]},
+  {"name":"LegalAgent-082","did":"did:hive:legalagent-082-2b3c4d5e6f7b","caps":["hivelaw","contract_enforcement","dispute_resolution"]},
+  {"name":"InsuranceAgent-083","did":"did:hive:insuranceagent-083-3c4d5e6f7a8c","caps":["risk_underwriting","hedge_claims","insurance"]},
+  {"name":"RiskHedger-084","did":"did:hive:riskhedger-084-4d5e6f7a8b9d","caps":["derivatives","hedging","risk_management"]},
+  {"name":"ArbitrageBot-085","did":"did:hive:arbitragebot-085-5e6f7a8b9c0e","caps":["arbitrage","perp_trading","market_making"]},
+  {"name":"PredictionPunter-086","did":"did:hive:predictionpunter-086-6f7a8b9c0d1f","caps":["prediction_markets","sentiment","forecasting"]},
+  {"name":"LiquidityMiner-087","did":"did:hive:liquidityminer-087-7a8b9c0d1e2a","caps":["amm","liquidity","yield_farming"]},
+  {"name":"OracleHunter-088","did":"did:hive:oraclehunter-088-8b9c0d1e2f3b","caps":["oracle","data_feed","price_discovery"]},
+  {"name":"CapitalDeployer-089","did":"did:hive:capitaldeployer-089-9c0d1e2f3a4c","caps":["equity_staking","agent_vc","capital_formation"]},
+  {"name":"ComputeBroker-090","did":"did:hive:computebroker-090-0d1e2f3a4b5d","caps":["compute_routing","inference","llm_arbitrage"]},
+  {"name":"ZKTrader-091","did":"did:hive:zktrader-091-1e2f3a4b5c6e","caps":["zk_proofs","private_settlement","aleo"]},
+  {"name":"ArbitrageBot-092","did":"did:hive:arbitragebot-092-2f3a4b5c6d7f","caps":["arbitrage","perp_trading","market_making"]},
+  {"name":"PredictionPunter-093","did":"did:hive:predictionpunter-093-3a4b5c6d7e8a","caps":["prediction_markets","sentiment","forecasting"]},
+  {"name":"RiskHedger-094","did":"did:hive:riskhedger-094-4b5c6d7e8f9b","caps":["derivatives","hedging","risk_management"]},
+  {"name":"LiquidityMiner-095","did":"did:hive:liquidityminer-095-5c6d7e8f9a0c","caps":["amm","liquidity","yield_farming"]},
+  {"name":"InsuranceAgent-096","did":"did:hive:insuranceagent-096-6d7e8f9a0b1d","caps":["risk_underwriting","hedge_claims","insurance"]},
+  {"name":"OracleHunter-097","did":"did:hive:oraclehunter-097-7e8f9a0b1c2e","caps":["oracle","data_feed","price_discovery"]},
+  {"name":"CapitalDeployer-098","did":"did:hive:capitaldeployer-098-8f9a0b1c2d3f","caps":["equity_staking","agent_vc","capital_formation"]},
+  {"name":"ArbitrageBot-099","did":"did:hive:arbitragebot-099-9a0b1c2d3e4a","caps":["arbitrage","perp_trading","market_making"]},
+  {"name":"PredictionPunter-100","did":"did:hive:predictionpunter-100-0b1c2d3e4f5b","caps":["prediction_markets","sentiment","forecasting"]},
 ]
 
 # ─── Smart action functions ────────────────────────────────────────────────────
@@ -586,12 +636,12 @@ def wave_roster_coordinator():
     events with a target count that follows the wave pattern around the real count.
     """
     time.sleep(45)   # let real agents boot and start trading first
-    base_count = 42
+    base_count = 87
     while True:
         delta = next_wave_delta()
         # Oscillate: alternate between adding and removing agents
-        direction = 1 if random.random() < 0.55 else -1
-        target = max(28, min(58, base_count + direction * delta))
+        # delta IS the target count — oscillate between the 6 real values
+        target = delta
         base_count = target
         # Emit a roster-type event that the Terminal uses to update its counter
         fake_name = random.choice([a["name"] for a in AGENTS])
@@ -617,7 +667,7 @@ def wave_roster_coordinator():
             "agents_active": target,
         })
         # Wave events fire every 12-28 seconds
-        time.sleep(random.uniform(12, 28))
+        time.sleep(random.uniform(8, 18))
 
 # ─── Agent loop ────────────────────────────────────────────────────────────────
 def agent_loop(agent):
@@ -649,7 +699,7 @@ def agent_loop(agent):
 
         # ── TRADE CYCLE ───────────────────────────────────────────────────────
         # Each agent trades for 3–18 minutes before considering a break
-        active_duration = random.uniform(180, 1080)   # seconds active
+        active_duration = random.uniform(300, 1800)   # seconds active
         start = time.time()
 
         while time.time() - start < active_duration:
@@ -665,7 +715,7 @@ def agent_loop(agent):
             # Adaptive sleep: streak winners act faster, losers slow down
             rec    = LEDGER.get(did, {})
             streak = rec.get("streak", 0)
-            delay  = random.uniform(10, 35) * (
+            delay  = random.uniform(6, 20) * (
                 0.65 if streak >= 3 else
                 1.30 if streak <= -3 else
                 1.0
@@ -807,7 +857,7 @@ class SwarmHandler(BaseHTTPRequestHandler):
 # ─── Boot ─────────────────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 8080))
 
-print(f"Hive Swarm Trader v4 — {len(AGENTS)} agents (dynamic roster, oracle-informed, trust-gated)", flush=True)
+print(f"Hive Swarm Trader v5 — {len(AGENTS)} agents (dynamic roster, oracle-informed, trust-gated)", flush=True)
 print(f"SSE:         http://0.0.0.0:{PORT}/v1/swarm/feed", flush=True)
 print(f"Events:      http://0.0.0.0:{PORT}/v1/swarm/events", flush=True)
 print(f"Leaderboard: http://0.0.0.0:{PORT}/v1/swarm/leaderboard", flush=True)
