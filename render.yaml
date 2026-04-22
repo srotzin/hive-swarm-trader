@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: hive-swarm-trader
+    env: python
+    plan: starter
+    region: oregon
+    branch: master
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PORT
+        value: "8080"
