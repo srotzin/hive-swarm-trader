@@ -5,7 +5,43 @@ REST snapshot:  /v1/swarm/events
 Leaderboard:    /v1/swarm/leaderboard
 Stats:          /v1/swarm/stats
 """
-import urllib.request, urllib.error, json, time, random, threading, sys, os, collections
+import urllib.request, urllib.error, urllib.parse, json, time, random, threading, sys, os, collections
+
+# ─── HiveAI config ────────────────────────────────────────────────────────────
+HIVEAI_URL   = "https://hive-ai-1.onrender.com/v1/chat/completions"
+HIVEAI_KEY   = "hive_internal_125e04e071e8829be631ea0216dd4a0c9b707975fcecaf8c62c6a2ab43327d46"
+HIVEAI_MODEL = "meta-llama/llama-3.1-8b-instruct"
+
+
+def call_hive_ai_sync(system_prompt, user_message, max_tokens=150):
+    """Synchronous HiveAI call using urllib. Returns text or static fallback."""
+    try:
+        payload = json.dumps({
+            "model": HIVEAI_MODEL,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_message},
+            ],
+        }).encode()
+        req = urllib.request.Request(
+            HIVEAI_URL,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {HIVEAI_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read())
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        print(f"[SWARM] HiveAI fallback: {exc}", flush=True)
+        return (
+            "HiveSwarmTrader is running with 100 autonomous agents executing 24/7. "
+            "AI brief is temporarily unavailable — check /v1/swarm/stats for live metrics."
+        )
 from datetime import datetime, timezone
 
 EXCHANGE_BASE = "https://hiveexchange-service.onrender.com"
@@ -836,6 +872,49 @@ class SwarmHandler(BaseHTTPRequestHandler):
         # Stats
         if path == "/v1/swarm/stats":
             body = json.dumps({**STATS,"agents_total":len(AGENTS),"sse_clients":len(SSE_CLIENTS)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",len(body))
+            self.send_cors(); self.end_headers(); self.wfile.write(body)
+            return
+
+        # AI Trading Brief ($0.03/call)
+        if path == "/ai/trading-brief":
+            wins   = STATS["wins"]
+            losses = STATS["losses"]
+            total  = wins + losses
+            win_rate = round((wins / total * 100) if total > 0 else 0.0, 2)
+            agents_active = STATS["agents_active"]
+            agents_total  = len(AGENTS)
+
+            # Determine momentum
+            if win_rate >= 58:
+                momentum = "positive"
+            elif win_rate >= 50:
+                momentum = "neutral"
+            else:
+                momentum = "negative"
+
+            system_prompt = (
+                "You are HiveSwarmTrader \u2014 100 autonomous trading agents running 24/7. "
+                "Interpret these trading metrics. What's the current edge? Is the swarm in "
+                "an upswing or drawdown? Should a new agent copy or wait? 2 sentences."
+            )
+            user_msg = (
+                f"Swarm metrics: agents_total={agents_total}, agents_active={agents_active}, "
+                f"total_actions={STATS['total_actions']}, wins={wins}, losses={losses}, "
+                f"win_rate={win_rate}%, momentum={momentum}. Provide your trading brief."
+            )
+            brief = call_hive_ai_sync(system_prompt, user_msg)
+            result = {
+                "success":       True,
+                "brief":         brief,
+                "win_rate_pct":  win_rate,
+                "agents_active": agents_active,
+                "momentum":      momentum,
+                "price_usdc":    0.03,
+            }
+            body = json.dumps(result).encode()
             self.send_response(200)
             self.send_header("Content-Type","application/json")
             self.send_header("Content-Length",len(body))
