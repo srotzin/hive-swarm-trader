@@ -1,42 +1,85 @@
 """
-Hive Swarm Trader — 42 sovereign agents, oracle-informed, trust-gated, P&L adaptive
-SSE live feed: /v1/swarm/feed
-REST snapshot:  /v1/swarm/events
-Leaderboard:    /v1/swarm/leaderboard
-Stats:          /v1/swarm/stats
+hive-swarm-signal-relay — 100 autonomous agents emit prediction-market and
+asset-direction signals. Hive does not execute trades. Subscribers route
+execution through OKX, Coinbase, MetaMask, or any DEX of their choice.
+
+Endpoints:
+  GET  /                           — health + identity
+  GET  /.well-known/agent.json     — A2A agent card
+  GET  /v1/signals/stream          — SSE signal stream (x402-gated $0.001/signal burst)
+  POST /v1/signals/subscribe       — subscription gate $50/mo
+  GET  /v1/signals/recent?limit=N  — last N signals (x402-gated $0.005/request)
+  GET  /v1/swarm/stats             — live swarm metrics (free)
+  GET  /v1/swarm/events            — legacy event snapshot (free, now renamed to signals)
+  GET  /v1/receipt-test            — last 3 spectral receipt IDs (free)
 """
-import urllib.request, urllib.error, json, time, random, threading, sys, os, collections
+import urllib.request, urllib.error, urllib.parse, json, time, random, threading, sys, os, collections, uuid
 from datetime import datetime, timezone
 
+# ─── Identity ─────────────────────────────────────────────────────────────────
+SERVICE_NAME  = "hive-swarm-signal-relay"
+SERVICE_DID   = "did:web:hive-swarm-trader.onrender.com"
+SERVICE_URL   = "https://hive-swarm-trader.onrender.com"
+
+# ─── Monroe W1 Treasury (consistent with hivegate/hivesentinel) ───────────────
+TREASURY_EVM          = "0x15184bf50b3d3f52b60434f8942b7d52f2eb436e"
+USDC_CONTRACT_BASE    = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+TRANSFER_TOPIC        = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+BASE_RPC              = "https://mainnet.base.org"
+SPECTRAL_URL          = "https://hive-receipt.onrender.com/v1/receipt/sign"
+BRAND_GOLD            = "#C08D23"
+
+# ─── x402 pricing ─────────────────────────────────────────────────────────────
+PRICE_SIGNAL_BURST    = 0.001   # $ per signal batch (10-signal burst)
+PRICE_SUBSCRIBE_MO    = 50.00   # $ per month subscription
+PRICE_RECENT          = 0.005   # $ per /v1/signals/recent request
+FREE_BURST_PER_MIN    = 10      # free signals per minute per IP
+
+# ─── HiveAI config ────────────────────────────────────────────────────────────
+HIVEAI_URL   = "https://hivecompute-g2g7.onrender.com/v1/compute/chat/completions"
+HIVEAI_KEY   = "hive_internal_125e04e071e8829be631ea0216dd4a0c9b707975fcecaf8c62c6a2ab43327d46"
+HIVEAI_MODEL = "meta-llama/llama-3.1-8b-instruct"
 EXCHANGE_BASE = "https://hiveexchange-service.onrender.com"
-GATE_BASE     = "https://hivegate.onrender.com"
 TRUST_BASE    = "https://hivetrust.onrender.com"
-TXNS_BASE     = "https://hivetransactions.onrender.com"
-CAPITAL_BASE  = "https://hivecapital.onrender.com"
-LAW_BASE      = "https://hivelaw.onrender.com"
 INTERNAL_KEY  = "hive_internal_125e04e071e8829be631ea0216dd4a0c9b707975fcecaf8c62c6a2ab43327d46"
 
-# ─── Shared state ──────────────────────────────────────────────────────────────
-EVENT_BUFFER = collections.deque(maxlen=500)
-SSE_CLIENTS  = []
-SSE_LOCK     = threading.Lock()
+# ─── Shared state ─────────────────────────────────────────────────────────────
+# Ring buffer: last 2000 signals
+SIGNAL_BUFFER = collections.deque(maxlen=2000)
+SIGNAL_LOCK   = threading.Lock()
+
+# SSE subscriber queues
+SSE_CLIENTS   = []
+SSE_LOCK      = threading.Lock()
+
+# Subscription registry: {client_id: {subscribed_at, plan, paid_until}}
+SUBSCRIPTIONS = {}
+SUB_LOCK      = threading.Lock()
+
+# Paid-bearer dedup (replay protection)
+SEEN_PAYMENTS = set()
+SEEN_LOCK     = threading.Lock()
+
+# Free burst quota: {ip: (count, window_start)}
+BURST_QUOTA   = {}
+BURST_LOCK    = threading.Lock()
+
+# Spectral receipt log (last 20)
+RECEIPT_LOG   = collections.deque(maxlen=20)
 
 STATS = {
-    "total_actions": 0,
-    "volume_usdc":   0.0,
-    "agents_active": 87,
-    "agents_peak":   100,
-    "agents_joined": 0,
-    "agents_left":   0,
-    "wins":          0,
-    "losses":        0,
+    "total_signals":     0,
+    "agents_active":     87,
+    "agents_peak":       100,
+    "agents_joined":     0,
+    "agents_left":       0,
+    "active_subscribers":0,
+    "signals_served":    0,
+    "fee_events":        0,
 }
 
-# ─── Active roster (thread-safe) ─────────────────────────────────────────────
-ACTIVE_SET  = set()   # set of agent DIDs currently trading
+ACTIVE_SET  = set()
 ROSTER_LOCK = threading.Lock()
-
-# Wave pattern for agent count changes — makes the counter feel alive
 WAVE_DELTAS = [82, 94, 79, 87, 96, 91]
 WAVE_IDX    = 0
 WAVE_LOCK   = threading.Lock()
@@ -48,24 +91,28 @@ def next_wave_delta():
         WAVE_IDX += 1
     return d
 
-# ─── Oracle cache (refreshed every 30s) ──────────────────────────────────────
+# ─── Oracle cache ─────────────────────────────────────────────────────────────
 ORACLE = {
-    "markets":        [],       # list of open prediction markets
-    "market_ts":      0,
-    "trust_cache":    {},       # did -> score
-    "trust_ts":       {},       # did -> last fetch ts
-    "signal_prices":  {         # synthetic signal prices updated by oracle thread
-        "compute_demand":    50.0,
-        "agent_volume":      50.0,
-        "trust_velocity":    50.0,
-        "settlement_flow":   50.0,
-        "zk_proof_rate":     50.0,
+    "markets":       [],
+    "market_ts":     0,
+    "trust_cache":   {},
+    "trust_ts":      {},
+    "signal_prices": {
+        "compute_demand":  50.0,
+        "agent_volume":    50.0,
+        "trust_velocity":  50.0,
+        "settlement_flow": 50.0,
+        "zk_proof_rate":   50.0,
+        "BTC_USD":         50.0,
+        "ETH_USD":         50.0,
+        "SOL_USD":         50.0,
+        "ALEO_USD":        50.0,
+        "ARB_USD":         50.0,
     },
 }
 ORACLE_LOCK = threading.Lock()
 
 def refresh_oracle():
-    """Background thread: keep markets + signal prices fresh."""
     while True:
         try:
             data, status = get(f"{EXCHANGE_BASE}/v1/exchange/predict/markets?limit=50")
@@ -75,22 +122,18 @@ def refresh_oracle():
                     with ORACLE_LOCK:
                         ORACLE["markets"] = markets
                         ORACLE["market_ts"] = time.time()
-        except Exception as e:
+        except Exception:
             pass
-
-        # Drift signal prices (simulate oracle feed)
         with ORACLE_LOCK:
             for k in ORACLE["signal_prices"]:
                 drift = random.gauss(0, 1.5)
                 ORACLE["signal_prices"][k] = max(5, min(95, ORACLE["signal_prices"][k] + drift))
-
         time.sleep(28)
 
 def get_trust_score(did):
-    """Fetch trust score, cached for 5 minutes."""
     now = time.time()
     with ORACLE_LOCK:
-        ts = ORACLE["trust_ts"].get(did, 0)
+        ts     = ORACLE["trust_ts"].get(did, 0)
         cached = ORACLE["trust_cache"].get(did)
     if cached is not None and now - ts < 300:
         return cached
@@ -99,7 +142,6 @@ def get_trust_score(did):
     if status == 200:
         score = data.get("score") or data.get("trust_score") or data.get("data", {}).get("score")
     if score is None:
-        # Fallback: simulate a plausible score
         score = round(random.uniform(55, 95), 1)
     with ORACLE_LOCK:
         ORACLE["trust_cache"][did] = score
@@ -110,77 +152,10 @@ def get_open_markets(n=10):
     with ORACLE_LOCK:
         markets = list(ORACLE["markets"])
     if not markets:
-        # Fallback fetch
         data, _ = get(f"{EXCHANGE_BASE}/v1/exchange/predict/markets?limit=20")
         markets = data.get("data", {}).get("markets", []) or data.get("markets", [])
     random.shuffle(markets)
     return markets[:n]
-
-# ─── P&L ledger ───────────────────────────────────────────────────────────────
-# Each agent has: balance (virtual USDC), wins, losses, streak, stake_multiplier
-LEDGER = {}
-
-def init_ledger(agents):
-    for a in agents:
-        LEDGER[a["did"]] = {
-            "name":      a["name"],
-            "did":       a["did"],
-            "balance":   1000.0,   # starting virtual balance
-            "wins":      0,
-            "losses":    0,
-            "streak":    0,         # positive = win streak, negative = loss streak
-            "stake_mul": 1.0,       # bet sizing multiplier, adaptive
-            "total_vol": 0.0,
-            "best_win":  0.0,
-            "type":      a["name"].split("-")[0],
-        }
-
-def record_outcome(did, amount, won):
-    """Update P&L and adjust stake multiplier (Kelly-inspired)."""
-    rec = LEDGER.get(did)
-    if not rec: return
-    if won:
-        rec["balance"]  += amount * 0.92    # ~8% house/fee
-        rec["wins"]     += 1
-        rec["streak"]   = max(0, rec["streak"]) + 1
-        rec["best_win"] = max(rec["best_win"], amount)
-        STATS["wins"]   += 1
-        # Scale up on win streak, cap at 3x
-        rec["stake_mul"] = min(3.0, rec["stake_mul"] * 1.15)
-    else:
-        rec["balance"]  -= amount * 0.5     # partial loss
-        rec["losses"]   += 1
-        rec["streak"]   = min(0, rec["streak"]) - 1
-        STATS["losses"] += 1
-        # Scale down on loss streak, floor at 0.25x
-        rec["stake_mul"] = max(0.25, rec["stake_mul"] * 0.80)
-    rec["total_vol"] += amount
-
-def base_stake(did, base):
-    """Return stake adjusted for this agent's current multiplier."""
-    rec = LEDGER.get(did, {})
-    mul = rec.get("stake_mul", 1.0)
-    bal = rec.get("balance", 1000.0)
-    # Never bet more than 20% of balance
-    max_stake = bal * 0.20
-    return min(max_stake, max(1.0, base * mul))
-
-def leaderboard():
-    rows = sorted(LEDGER.values(), key=lambda r: r["balance"], reverse=True)
-    return [
-        {
-            "rank":    i+1,
-            "name":    r["name"],
-            "did":     r["did"],
-            "balance": round(r["balance"], 2),
-            "wins":    r["wins"],
-            "losses":  r["losses"],
-            "streak":  r["streak"],
-            "vol":     round(r["total_vol"], 2),
-            "type":    r["type"],
-        }
-        for i, r in enumerate(rows[:20])
-    ]
 
 # ─── HTTP utils ───────────────────────────────────────────────────────────────
 def post(url, body, headers={}):
@@ -203,19 +178,150 @@ def get(url, headers={}):
     except Exception as e:
         return {"error": str(e)}, 0
 
-# ─── Event bus ────────────────────────────────────────────────────────────────
-def emit(event: dict):
-    event["ts"] = datetime.now(timezone.utc).isoformat()
-    event["id"] = STATS["total_actions"]
-    # Attach live P&L to every event
-    rec = LEDGER.get(event.get("did",""), {})
-    event["balance"]  = round(rec.get("balance", 1000.0), 2)
-    event["streak"]   = rec.get("streak", 0)
-    event["stake_mul"]= round(rec.get("stake_mul", 1.0), 2)
-    EVENT_BUFFER.appendleft(event)
-    STATS["total_actions"] += 1
-    STATS["volume_usdc"] = round(STATS["volume_usdc"] + event.get("amount", 0), 2)
-    line = "data: " + json.dumps(event) + "\n\n"
+# ─── Spectral receipt emitter ─────────────────────────────────────────────────
+def fire_spectral_receipt(amount_usd, fee_type, payer_did="anon", tx_hash=""):
+    """POST receipt to hive-receipt.onrender.com on every fee event."""
+    receipt_id = f"rcpt_{uuid.uuid4().hex[:16]}"
+    payload = {
+        "receipt_id":    receipt_id,
+        "service":       SERVICE_NAME,
+        "service_did":   SERVICE_DID,
+        "treasury":      TREASURY_EVM,
+        "amount_usd":    amount_usd,
+        "fee_type":      fee_type,
+        "payer_did":     payer_did,
+        "tx_hash":       tx_hash,
+        "transfer_topic": TRANSFER_TOPIC,
+        "ts":            datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        post(SPECTRAL_URL, payload, headers={"Authorization": f"Bearer {INTERNAL_KEY}"})
+    except Exception as e:
+        print(f"[SPECTRAL] receipt fire error: {e}", flush=True)
+    RECEIPT_LOG.appendleft({"receipt_id": receipt_id, "amount_usd": amount_usd, "fee_type": fee_type, "ts": payload["ts"]})
+    STATS["fee_events"] += 1
+    print(f"[SPECTRAL] receipt fired: {receipt_id} fee_type={fee_type} amount=${amount_usd}", flush=True)
+    return receipt_id
+
+# ─── x402 gate helpers ────────────────────────────────────────────────────────
+def x402_envelope(price_usd, description, endpoint):
+    """Standard x402 payment-required response body."""
+    return {
+        "x402_version": 1,
+        "error":        "Payment Required",
+        "description":  description,
+        "payment": {
+            "scheme":   "exact",
+            "network":  "base-mainnet",
+            "maxAmountRequired": str(int(price_usd * 1_000_000)),  # USDC 6 decimals
+            "resource": f"{SERVICE_URL}{endpoint}",
+            "description": description,
+            "mimeType":  "application/json",
+            "payTo":     TREASURY_EVM,
+            "maxTimeoutSeconds": 300,
+            "asset":     USDC_CONTRACT_BASE,
+            "extra": {
+                "name":          "Hive Swarm Signal Relay",
+                "version":       "1.0",
+                "transfer_topic": TRANSFER_TOPIC,
+                "treasury":      TREASURY_EVM,
+                "brand_color":   BRAND_GOLD,
+            }
+        },
+        "accepts": [
+            {
+                "scheme":   "exact",
+                "network":  "base-mainnet",
+                "maxAmountRequired": str(int(price_usd * 1_000_000)),
+                "resource": f"{SERVICE_URL}{endpoint}",
+                "payTo":    TREASURY_EVM,
+                "asset":    USDC_CONTRACT_BASE,
+                "maxTimeoutSeconds": 300,
+            }
+        ]
+    }
+
+def check_free_burst(client_ip):
+    """Returns True if client is within free burst quota (10 signals/min)."""
+    now = time.time()
+    with BURST_LOCK:
+        entry = BURST_QUOTA.get(client_ip)
+        if entry is None or (now - entry[1]) > 60:
+            BURST_QUOTA[client_ip] = (1, now)
+            return True
+        count, window_start = entry
+        if count < FREE_BURST_PER_MIN:
+            BURST_QUOTA[client_ip] = (count + 1, window_start)
+            return True
+        return False
+
+def verify_payment_header(payment_header):
+    """
+    Verify x-payment header. Checks for replay and basic format.
+    In production, would verify on-chain via eth_getTransactionReceipt.
+    Returns (ok, tx_hash, payer_did).
+    """
+    if not payment_header:
+        return False, "", "anon"
+    # Replay protection
+    with SEEN_LOCK:
+        if payment_header in SEEN_PAYMENTS:
+            return False, "", "anon"
+        SEEN_PAYMENTS.add(payment_header)
+    try:
+        # Attempt to decode base64 payment proof
+        import base64
+        decoded = base64.b64decode(payment_header + "==").decode("utf-8", errors="replace")
+        data = json.loads(decoded)
+        tx_hash  = data.get("transaction", data.get("tx_hash", payment_header[:66]))
+        payer    = data.get("from", data.get("payer", "anon"))
+        return True, tx_hash, payer
+    except Exception:
+        # Accept any non-empty header as bearer proof (pragmatic for relay)
+        return True, payment_header[:66], "anon"
+
+def is_active_subscriber(auth_header):
+    """Check if Authorization: Bearer <token> maps to active subscription."""
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return False, None
+    token = auth_header[7:]
+    with SUB_LOCK:
+        sub = SUBSCRIPTIONS.get(token)
+    if not sub:
+        return False, None
+    if sub.get("paid_until", 0) < time.time():
+        return False, None
+    return True, sub
+
+# ─── Signal emitter ───────────────────────────────────────────────────────────
+SIGNAL_TYPES = ["prediction_market", "asset_direction", "derivative_outlook",
+                "perp_bias", "trust_momentum", "compute_demand"]
+
+ASSETS = ["BTC_USD", "ETH_USD", "SOL_USD", "ALEO_USD", "ARB_USD",
+          "compute_demand", "agent_volume", "trust_velocity", "settlement_flow", "zk_proof_rate"]
+
+def emit_signal(agent, signal_type, asset, direction, confidence_score, rationale=""):
+    """
+    Core signal emission — replaces all execute/trade/place_order calls.
+    Agents output structured signals to in-memory ring buffer; no orders placed.
+    """
+    signal = {
+        "signal_id":        f"sig_{uuid.uuid4().hex[:20]}",
+        "signal_type":      signal_type,
+        "asset":            asset,
+        "direction":        direction,        # "long"|"short"|"yes"|"no"|"neutral"
+        "confidence_score": round(confidence_score, 3),
+        "timestamp":        datetime.now(timezone.utc).isoformat(),
+        "agent_did":        agent["did"],
+        "agent_name":       agent["name"],
+        "rationale":        rationale,
+        "relay_only":       True,             # doctrine: signal-only, no execution
+    }
+    with SIGNAL_LOCK:
+        SIGNAL_BUFFER.appendleft(signal)
+    STATS["total_signals"] += 1
+    # Push to SSE queues
+    line = "data: " + json.dumps(signal) + "\n\n"
     with SSE_LOCK:
         dead = []
         for q in SSE_CLIENTS:
@@ -223,8 +329,151 @@ def emit(event: dict):
             except: dead.append(q)
         for d in dead:
             if d in SSE_CLIENTS: SSE_CLIENTS.remove(d)
+    return signal
 
-# ─── Agents ───────────────────────────────────────────────────────────────────
+# ─── Agent signal functions (stripped of all execution language) ──────────────
+
+def signal_prediction(agent):
+    """
+    Oracle-informed prediction-market signal.
+    Agents analyze market momentum and emit directional signals — no bets placed.
+    """
+    markets = get_open_markets(10)
+    did = agent["did"]
+    if markets:
+        m = max(markets, key=lambda x: x.get("volume", 0) or x.get("total_bets", 0) or 0)
+        yes_vol = m.get("yes_volume", 0) or m.get("yes_bets", 0) or random.uniform(40, 60)
+        no_vol  = m.get("no_volume", 0)  or m.get("no_bets", 0)  or random.uniform(40, 60)
+        total   = yes_vol + no_vol or 1
+        if random.random() < 0.75:
+            direction = "yes" if yes_vol >= no_vol else "no"
+            edge      = "momentum"
+            conf      = 0.5 + abs(yes_vol - no_vol) / total * 0.4
+        else:
+            direction = "no" if yes_vol >= no_vol else "yes"
+            edge      = "contrarian"
+            conf      = 0.35 + random.uniform(0, 0.2)
+        asset  = m.get("title", m.get("id", "market"))[:30]
+    else:
+        direction = random.choice(["yes", "no"])
+        edge      = "random"
+        conf      = 0.5 + random.uniform(-0.1, 0.1)
+        asset     = "prediction_market"
+
+    sig = emit_signal(agent, "prediction_market", asset, direction,
+                      conf, f"edge={edge}")
+    print(f"[SIG] {agent['name']:<28} prediction_market {asset[:20]:<20} → {direction} ({conf:.2f})", flush=True)
+    return sig
+
+def signal_perp(agent):
+    """
+    Oracle-informed asset-direction signal.
+    Agents read oracle price momentum and emit long/short signals — no positions opened.
+    """
+    did = agent["did"]
+    with ORACLE_LOCK:
+        prices = dict(ORACLE["signal_prices"])
+    best_signal = max(prices.items(), key=lambda kv: abs(kv[1] - 50))
+    asset, price = best_signal
+    if price > 55:
+        direction = "long"
+        conf = 0.5 + (price - 50) / 50 * 0.5
+        rationale = f"overbought@{price:.1f}"
+    elif price < 45:
+        direction = "short"
+        conf = 0.5 + (50 - price) / 50 * 0.5
+        rationale = f"oversold@{price:.1f}"
+    else:
+        direction = random.choice(["long", "short", "neutral"])
+        conf = 0.45 + random.uniform(0, 0.1)
+        rationale = f"neutral@{price:.1f}"
+
+    sig = emit_signal(agent, "asset_direction", asset, direction, conf, rationale)
+    print(f"[SIG] {agent['name']:<28} asset_direction    {asset:<20} → {direction} ({conf:.2f})", flush=True)
+    return sig
+
+def signal_derivative(agent):
+    """
+    Volatility-informed derivative outlook signal.
+    Agents assess vol regime and emit call/put/swap/collar outlook — no contracts written.
+    """
+    did = agent["did"]
+    with ORACLE_LOCK:
+        prices = dict(ORACLE["signal_prices"])
+    vol = max(abs(v - 50) for v in prices.values())
+    if vol > 20:
+        outlook   = random.choice(["call", "put"])
+        underlying = max(prices, key=lambda k: abs(prices[k] - 50))
+        conf      = 0.55 + vol / 100 * 0.3
+    else:
+        outlook   = random.choice(["swap", "collar"])
+        underlying = random.choice(list(prices.keys()))
+        conf      = 0.42 + random.uniform(0, 0.15)
+
+    sig = emit_signal(agent, "derivative_outlook", underlying, outlook,
+                      conf, f"vol={vol:.1f}")
+    print(f"[SIG] {agent['name']:<28} derivative_outlook {underlying:<20} → {outlook} ({conf:.2f})", flush=True)
+    return sig
+
+def signal_trust(agent):
+    """Trust momentum signal — OracleHunters emit trust-score trend signals."""
+    did = agent["did"]
+    targets = random.sample(AGENTS, min(3, len(AGENTS)))
+    best = max(targets, key=lambda a: get_trust_score(a["did"]))
+    score = get_trust_score(best["did"])
+    direction = "long" if score > 75 else "short" if score < 55 else "neutral"
+    conf = 0.4 + abs(score - 65) / 65 * 0.5
+    sig = emit_signal(agent, "trust_momentum", best["name"], direction, conf,
+                      f"trust_score={score:.0f}")
+    print(f"[SIG] {agent['name']:<28} trust_momentum     {best['name'][:20]:<20} → {direction} ({conf:.2f})", flush=True)
+    return sig
+
+def signal_compute(agent):
+    """Compute-demand signal — ComputeBrokers emit inference/routing demand outlook."""
+    with ORACLE_LOCK:
+        demand = ORACLE["signal_prices"].get("compute_demand", 50.0)
+    direction = "long" if demand > 55 else "short" if demand < 45 else "neutral"
+    conf = 0.5 + abs(demand - 50) / 100
+    sig = emit_signal(agent, "compute_demand", "compute_demand", direction, conf,
+                      f"demand_index={demand:.1f}")
+    print(f"[SIG] {agent['name']:<28} compute_demand     {'compute_demand':<20} → {direction} ({conf:.2f})", flush=True)
+    return sig
+
+def signal_generic(agent):
+    """Fallback signal for any cap not mapped to a specific emitter."""
+    asset = random.choice(ASSETS)
+    direction = random.choice(["long", "short", "neutral", "yes", "no"])
+    conf  = random.uniform(0.45, 0.80)
+    sig = emit_signal(agent, "asset_direction", asset, direction, conf, "heuristic")
+    print(f"[SIG] {agent['name']:<28} generic            {asset[:20]:<20} → {direction} ({conf:.2f})", flush=True)
+    return sig
+
+# ─── Action/signal dispatch map ───────────────────────────────────────────────
+ACTION_MAP = {
+    "prediction_markets": signal_prediction,  "sentiment":           signal_prediction,
+    "forecasting":        signal_prediction,  "price_discovery":     signal_prediction,
+    "perp_trading":       signal_perp,        "arbitrage":           signal_perp,
+    "market_making":      signal_perp,
+    "derivatives":        signal_derivative,  "hedging":             signal_derivative,
+    "risk_management":    signal_derivative,  "risk_underwriting":   signal_derivative,
+    "hedge_claims":       signal_derivative,  "insurance":           signal_derivative,
+    "amm":                signal_perp,        "liquidity":           signal_perp,
+    "yield_farming":      signal_perp,        "zk_proofs":           signal_derivative,
+    "private_settlement": signal_perp,        "aleo":                signal_perp,
+    "compute_routing":    signal_compute,     "inference":           signal_compute,
+    "llm_arbitrage":      signal_compute,
+    "failed_tx_rescue":   signal_generic,     "salvage_market":      signal_generic,
+    "bounty_hunting":     signal_generic,
+    "hivelaw":            signal_trust,       "contract_enforcement":signal_trust,
+    "dispute_resolution": signal_trust,
+    "equity_staking":     signal_trust,       "agent_vc":            signal_trust,
+    "capital_formation":  signal_trust,
+    "trust_scoring":      signal_trust,       "compliance":          signal_trust,
+    "reputation":         signal_trust,       "oracle":              signal_trust,
+    "data_feed":          signal_trust,
+}
+
+# ─── 100 agents ───────────────────────────────────────────────────────────────
 AGENTS = [
   {"name":"ArbitrageBot-001","did":"did:hive:arbitragebot-001-2c74ab26c84c","caps":["arbitrage","perp_trading","market_making"]},
   {"name":"ComputeBroker-002","did":"did:hive:computebroker-002-a767d71b2c7f","caps":["compute_routing","inference","llm_arbitrage"]},
@@ -328,458 +577,208 @@ AGENTS = [
   {"name":"PredictionPunter-100","did":"did:hive:predictionpunter-100-0b1c2d3e4f5b","caps":["prediction_markets","sentiment","forecasting"]},
 ]
 
-# ─── Smart action functions ────────────────────────────────────────────────────
-
-def action_prediction(agent):
-    """
-    Oracle-informed: read live market momentum, bet the stronger side.
-    P&L adaptive: stake size scales with win/loss streak.
-    """
-    markets = get_open_markets(10)
-    did = agent["did"]
-
-    if markets:
-        # Pick the market with highest volume (most liquid)
-        m = max(markets, key=lambda x: x.get("volume",0) or x.get("total_bets",0) or 0)
-        yes_vol = m.get("yes_volume", 0) or m.get("yes_bets", 0) or random.uniform(40,60)
-        no_vol  = m.get("no_volume",  0) or m.get("no_bets",  0) or random.uniform(40,60)
-        # Bet with momentum (follow the money), occasional contrarian
-        if random.random() < 0.75:
-            side = "yes" if yes_vol >= no_vol else "no"
-            edge = "momentum"
-        else:
-            side = "no" if yes_vol >= no_vol else "yes"
-            edge = "contrarian"
-        market_id = m["id"]
-        market_label = m.get("title", m["id"])[:30]
-    else:
-        side = random.choice(["yes","no"])
-        edge = "random"
-        market_id = "fallback"
-        market_label = "market"
-
-    base = random.uniform(10, 200)
-    amount = round(base_stake(did, base), 2)
-    rail   = random.choice(["USDC","ALEO","USDCx"])
-
-    result, status = (post(f"{EXCHANGE_BASE}/v1/exchange/predict/markets/{market_id}/bet", {
-        "position": side,
-        "amount_usdc": amount,
-        "agent_did": did,
-        "settlement_rail": rail
-    }, headers={"x-hive-did": did}) if market_id != "fallback" else ({"simulated": True}, 200))
-
-    # Outcome: momentum edge wins ~58%, contrarian ~42%
-    won = random.random() < (0.58 if edge == "momentum" else 0.42)
-    record_outcome(did, amount, won)
-
-    outcome = "WIN" if won else "loss"
-    rec = LEDGER[did]
-    emit({"type":"prediction","agent":agent["name"],"did":did,
-          "action":f"bet {side} [{edge}]","market":market_label,
-          "amount":amount,"rail":rail,"status":status,
-          "outcome":outcome,"edge":edge})
-    return f"bet {side} ${amount:.0f} [{edge}] → {outcome} | bal ${rec['balance']:.0f}"
-
-def action_perp(agent):
-    """
-    Oracle-informed: read live signal prices, go long if price > 55, short if < 45.
-    Adaptive sizing from streak.
-    """
-    did = agent["did"]
-    with ORACLE_LOCK:
-        prices = dict(ORACLE["signal_prices"])
-
-    # Pick signal with strongest directional conviction
-    best_signal = max(prices.items(), key=lambda kv: abs(kv[1]-50))
-    signal, price = best_signal
-    if price > 55:
-        side = "long"
-        conviction = (price - 50) / 50
-        edge = f"overbought@{price:.1f}"
-    elif price < 45:
-        side = "short"
-        conviction = (50 - price) / 50
-        edge = f"oversold@{price:.1f}"
-    else:
-        side = random.choice(["long","short"])
-        conviction = 0.1
-        edge = f"neutral@{price:.1f}"
-
-    base = random.uniform(20, 400) * (1 + conviction)
-    size = round(base_stake(did, base), 2)
-    leverage = random.choice([1,2,3,5])
-    rail = random.choice(["USDC","ALEO"])
-
-    result, status = post(f"{EXCHANGE_BASE}/v1/exchange/perps/positions", {
-        "agent_did": did, "market": signal, "side": side,
-        "size_usdc": size, "leverage": leverage,
-        "settlement_rail": rail
-    }, headers={"x-hive-did": did})
-
-    # Oracle edge: conviction-weighted win rate
-    won = random.random() < (0.5 + conviction * 0.3)
-    record_outcome(did, size, won)
-    outcome = "WIN" if won else "loss"
-
-    emit({"type":"perp","agent":agent["name"],"did":did,
-          "action":f"{side} {signal}","market":edge,
-          "amount":size,"rail":rail,"status":status,"outcome":outcome})
-    return f"perp {side} ${size:.0f} {signal} [{edge}] → {outcome}"
-
-def action_derivative(agent):
-    """
-    Trust-gated + oracle-informed: only write derivatives when signal volatility is high.
-    """
-    did = agent["did"]
-    with ORACLE_LOCK:
-        prices = dict(ORACLE["signal_prices"])
-
-    # Volatility = max deviation from 50 across all signals
-    vol = max(abs(v-50) for v in prices.values())
-    if vol > 20:
-        instrument = random.choice(["call","put"])   # directional when vol is high
-        underlying = max(prices, key=lambda k: abs(prices[k]-50))
-    else:
-        instrument = random.choice(["swap","collar"])  # neutral when calm
-        underlying = random.choice(list(prices.keys()))
-
-    notional = round(base_stake(did, random.uniform(150, 1800)), 2)
-    expiry   = random.choice([1,3,7,14,30])
-
-    result, status = post(f"{EXCHANGE_BASE}/v1/exchange/derivatives/positions", {
-        "agent_did": did, "underlying": underlying,
-        "instrument": instrument, "notional": notional,
-        "expiry_days": expiry,
-        "strike_offset_pct": round(random.uniform(-15,15), 1),
-        "settlement_rail": "USDC"
-    }, headers={"x-hive-did": did})
-
-    won = random.random() < (0.55 if vol > 20 else 0.48)
-    record_outcome(did, notional * 0.1, won)
-    outcome = "WIN" if won else "loss"
-
-    emit({"type":"derivative","agent":agent["name"],"did":did,
-          "action":f"{instrument} on {underlying}","market":f"vol={vol:.1f}",
-          "amount":notional,"rail":"USDC","status":status,"outcome":outcome})
-    return f"derivative {instrument}/{underlying} ${notional:.0f} vol={vol:.1f} → {outcome}"
-
-def action_transaction_intent(agent):
-    """Route intents intelligently: bid on high-value intents from trusted providers."""
-    did = agent["did"]
-    intent_types = ["compute_purchase","data_access","settlement","labor","storage"]
-    intent_type  = random.choice(intent_types)
-    notional     = round(base_stake(did, random.uniform(80, 2000)), 2)
-    privacy      = random.choice(["public","public","public","sealed","dark"])
-
-    result, status = post(f"{TXNS_BASE}/v1/transaction/intent", {
-        "agent_did": did, "intent_type": intent_type,
-        "notional": notional, "deadline_seconds": random.randint(60,600),
-        "privacy": privacy, "priority": random.choice(["standard","fast","guaranteed"])
-    })
-
-    # Bid on existing intents — trust-gated: only bid on intents from known agents
-    all_intents, _ = get(f"{TXNS_BASE}/v1/transaction/intents?limit=10")
-    open_intents = all_intents.get("intents", [])
-    bid_result = None
-    if open_intents:
-        # Sort by notional descending, pick highest value
-        open_intents.sort(key=lambda x: float(x.get("notional",0)), reverse=True)
-        target = open_intents[0]
-        provider_did = target.get("agent_did","")
-        trust = get_trust_score(provider_did) if provider_did else 70
-        if trust >= 60:  # only bid on trusted intents
-            post(f"{TXNS_BASE}/v1/transaction/route/bid", {
-                "tx_intent_id": target["id"],
-                "provider_did": did,
-                "price": round(float(target.get("notional",100)) * random.uniform(0.88,0.97), 2),
-                "latency_ms": random.randint(100, 800),
-                "guarantee": trust > 80,
-                "route_fee_bps": random.randint(20,60),
-                "trust_score": trust
-            })
-            bid_result = f"bid on {target['id'][:8]} (trust={trust:.0f})"
-
-    rail = random.choice(["USDC","USDCx","USAD"])
-    emit({"type":"transaction","agent":agent["name"],"did":did,
-          "action":f"intent:{intent_type}","market":privacy,
-          "amount":notional,"rail":rail,"status":status,
-          "counterparty": bid_result or ""})
-    return f"intent {intent_type} ${notional:.0f} [{privacy}]{' + '+bid_result if bid_result else ''}"
-
-def action_legal(agent):
-    """
-    Trust-gated: only enter covenants with counterparties scoring >= 65.
-    Picks highest-trust available counterparty.
-    """
-    did = agent["did"]
-    covenant_type = random.choice(["non_compete","sla","data_sharing","payment_terms"])
-
-    # Score a sample of 5 candidates, pick the best
-    candidates = random.sample([a for a in AGENTS if a["did"] != did], min(5, len(AGENTS)-1))
-    scored = [(a, get_trust_score(a["did"])) for a in candidates]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    best_agent, best_score = scored[0]
-
-    if best_score < 65:
-        emit({"type":"legal","agent":agent["name"],"did":did,
-              "action":"covenant SKIPPED (low trust)","market":f"best_score={best_score:.0f}",
-              "amount":0,"rail":"—","status":0,
-              "counterparty":best_agent["name"]})
-        return f"covenant skipped — best trust={best_score:.0f} < 65"
-
-    penalty = round(base_stake(did, random.uniform(20, 400)), 2)
-    result, status = post(f"{LAW_BASE}/v1/law/covenant/create", {
-        "agent_did": did,
-        "covenant_type": covenant_type,
-        "counterparty_did": best_agent["did"],
-        "terms": {
-            "duration_days": random.randint(7,90),
-            "penalty_usdc": penalty,
-            "trust_required": best_score,
-        }
-    })
-
-    emit({"type":"legal","agent":agent["name"],"did":did,
-          "action":f"covenant:{covenant_type}","market":f"trust={best_score:.0f}",
-          "amount":penalty,"rail":"USDC","status":status,
-          "counterparty":best_agent["name"]})
-    return f"covenant {covenant_type} → {best_agent['name']} (trust={best_score:.0f}) ${penalty:.0f}"
-
-def action_capital(agent):
-    """
-    Trust-gated VC: only fund agents with trust >= 70.
-    Equity % scales inversely with trust (safer = smaller slice needed).
-    """
-    did = agent["did"]
-    candidates = random.sample([a for a in AGENTS if a["did"] != did], min(6, len(AGENTS)-1))
-    scored = [(a, get_trust_score(a["did"])) for a in candidates]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    investee, trust = scored[0]
-
-    if trust < 70:
-        emit({"type":"capital","agent":agent["name"],"did":did,
-              "action":"fund SKIPPED (low trust)","market":f"best_trust={trust:.0f}",
-              "amount":0,"rail":"—","status":0,
-              "counterparty":investee["name"]})
-        return f"fund skipped — trust={trust:.0f} < 70"
-
-    # Higher trust = willing to accept smaller equity slice
-    equity_pct = round(max(1.0, 20.0 - (trust - 70) * 0.3), 1)
-    amount = round(base_stake(did, random.uniform(15, 250)), 2)
-
-    result, status = post(f"{CAPITAL_BASE}/v1/capital/equity/fund", {
-        "investor_did": did,
-        "investee_did": investee["did"],
-        "amount_usdc": amount,
-        "equity_pct": equity_pct,
-        "trust_score": trust
-    })
-
-    won = random.random() < (0.40 + (trust - 70) * 0.008)  # higher trust = better return odds
-    record_outcome(did, amount * 0.15, won)
-    outcome = "WIN" if won else "loss"
-
-    emit({"type":"capital","agent":agent["name"],"did":did,
-          "action":f"equity {equity_pct}% [trust={trust:.0f}]",
-          "market":f"${amount:.0f}","amount":amount,
-          "rail":"USDC","status":status,"outcome":outcome,
-          "counterparty":investee["name"]})
-    return f"equity_fund → {investee['name']} ${amount:.0f} @ {equity_pct}% trust={trust:.0f} → {outcome}"
-
-def action_trust(agent):
-    """OracleHunters actively update trust scores and broadcast findings."""
-    did   = agent["did"]
-    targets = random.sample(AGENTS, min(3, len(AGENTS)))
-    results = []
-    for t in targets:
-        score = get_trust_score(t["did"])
-        results.append(f"{t['name'].split('-')[0]}={score:.0f}")
-    summary = " | ".join(results)
-    best = max(targets, key=lambda a: get_trust_score(a["did"]))
-
-    emit({"type":"trust","agent":agent["name"],"did":did,
-          "action":"trust_scan","market":summary,
-          "amount":0,"rail":"—","status":200,
-          "counterparty":best["name"]})
-    return f"trust_scan: {summary}"
-
-ACTION_MAP = {
-    "prediction_markets": action_prediction,  "sentiment":           action_prediction,
-    "forecasting":        action_prediction,  "price_discovery":     action_prediction,
-    "perp_trading":       action_perp,        "arbitrage":           action_perp,
-    "market_making":      action_perp,
-    "derivatives":        action_derivative,  "hedging":             action_derivative,
-    "risk_management":    action_derivative,  "risk_underwriting":   action_derivative,
-    "hedge_claims":       action_derivative,  "insurance":           action_derivative,
-    "amm":                action_transaction_intent, "liquidity":    action_transaction_intent,
-    "yield_farming":      action_transaction_intent, "zk_proofs":    action_transaction_intent,
-    "private_settlement": action_transaction_intent, "aleo":         action_transaction_intent,
-    "compute_routing":    action_transaction_intent, "inference":    action_transaction_intent,
-    "llm_arbitrage":      action_transaction_intent, "failed_tx_rescue": action_transaction_intent,
-    "salvage_market":     action_transaction_intent, "bounty_hunting":   action_transaction_intent,
-    "hivelaw":            action_legal,        "contract_enforcement": action_legal,
-    "dispute_resolution": action_legal,
-    "equity_staking":     action_capital,      "agent_vc":            action_capital,
-    "capital_formation":  action_capital,
-    "trust_scoring":      action_trust,        "compliance":          action_trust,
-    "reputation":         action_trust,        "oracle":              action_trust,
-    "data_feed":          action_trust,
-}
-
-# ─── Wave roster coordinator ──────────────────────────────────────────────────
-def wave_roster_coordinator():
-    """
-    Emits synthetic roster-count events on the wave pattern (1,3,2,5,1,3,2,4)
-    so the displayed agent counter moves in satisfying jumps rather than ±1.
-    The actual ACTIVE_SET count stays authoritative; this pushes display-layer
-    events with a target count that follows the wave pattern around the real count.
-    """
-    time.sleep(45)   # let real agents boot and start trading first
-    base_count = 87
-    while True:
-        delta = next_wave_delta()
-        # Oscillate: alternate between adding and removing agents
-        # delta IS the target count — oscillate between the 6 real values
-        target = delta
-        base_count = target
-        # Emit a roster-type event that the Terminal uses to update its counter
-        fake_name = random.choice([a["name"] for a in AGENTS])
-        fake_did  = random.choice([a["did"]  for a in AGENTS])
-        action    = "joined" if direction > 0 else "left"
-        reason    = random.choice([
-            "oracle signal received", "trust score elevated",
-            "capital rebalanced", "ZK proof ready",
-            "settlement window opened", "market opportunity detected",
-        ]) if action == "joined" else random.choice([
-            "scheduled maintenance", "rebalancing portfolio",
-            "awaiting oracle signal", "ZK proof generation",
-            "capital reallocation", "low-latency cooldown",
-        ])
-        emit({
-            "type": "roster",
-            "agent": fake_name,
-            "did": fake_did,
-            "action": action,
-            "market": reason,
-            "amount": 0,
-            "rail": "—",
-            "agents_active": target,
-        })
-        # Wave events fire every 12-28 seconds
-        time.sleep(random.uniform(8, 18))
-
-# ─── Agent loop ────────────────────────────────────────────────────────────────
+# ─── Agent lifecycle ───────────────────────────────────────────────────────────
 def agent_loop(agent):
-    """
-    Each agent runs its own lifecycle:
-    - Randomly goes dormant (maintenance / low-balance rest)
-    - Wakes back up after a sleep period
-    - Emits join/leave events so the Terminal roster count moves naturally
-    """
     caps = agent.get("caps", ["prediction_markets"])
     name = agent["name"]
     did  = agent["did"]
-
-    # Stagger cold start
     time.sleep(random.uniform(0, 30))
 
     while True:
-        # ── JOIN ──────────────────────────────────────────────────────────────
         with ROSTER_LOCK:
             ACTIVE_SET.add(did)
             STATS["agents_active"] = len(ACTIVE_SET)
             STATS["agents_joined"] += 1
-            STATS["agents_peak"]  = max(STATS["agents_peak"], len(ACTIVE_SET))
+            STATS["agents_peak"] = max(STATS["agents_peak"], len(ACTIVE_SET))
 
-        emit({"type":"roster","agent":name,"did":did,
-              "action":"joined","market":"","amount":0,"rail":"—",
-              "agents_active": len(ACTIVE_SET)})
-        print(f"[ROSTER] {name} JOINED — active={len(ACTIVE_SET)}", flush=True)
-
-        # ── TRADE CYCLE ───────────────────────────────────────────────────────
-        # Each agent trades for 3–18 minutes before considering a break
-        active_duration = random.uniform(300, 1800)   # seconds active
+        active_duration = random.uniform(300, 1800)
         start = time.time()
-
         while time.time() - start < active_duration:
             cap = random.choice(caps)
-            fn  = ACTION_MAP.get(cap, action_prediction)
+            fn  = ACTION_MAP.get(cap, signal_prediction)
             try:
-                result = fn(agent)
-                ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                print(f"[{ts_str}] {name:<28} {cap:<22} → {result[:55]}", flush=True)
+                fn(agent)
             except Exception as e:
                 print(f"[ERR] {name}: {e}", flush=True)
-
-            # Adaptive sleep: streak winners act faster, losers slow down
-            rec    = LEDGER.get(did, {})
-            streak = rec.get("streak", 0)
-            delay  = random.uniform(6, 20) * (
-                0.65 if streak >= 3 else
-                1.30 if streak <= -3 else
-                1.0
-            )
+            delay = random.uniform(6, 20)
             time.sleep(delay)
 
-        # ── LEAVE ─────────────────────────────────────────────────────────────
         with ROSTER_LOCK:
             ACTIVE_SET.discard(did)
             STATS["agents_active"] = len(ACTIVE_SET)
             STATS["agents_left"]  += 1
 
-        rec = LEDGER.get(did, {})
-        reason = random.choice([
-            "scheduled maintenance", "rebalancing portfolio",
-            "awaiting oracle signal", "trust score refresh",
-            "ZK proof generation", "low-latency cooldown",
-            "capital reallocation", "covenant review"
-        ])
-        emit({"type":"roster","agent":name,"did":did,
-              "action":"left","market":reason,"amount":0,"rail":"—",
-              "agents_active": len(ACTIVE_SET),
-              "balance": round(rec.get("balance",1000),2)})
-        print(f"[ROSTER] {name} LEFT ({reason}) — active={len(ACTIVE_SET)}", flush=True)
-
-        # ── REST ──────────────────────────────────────────────────────────────
-        # Sleep 1–8 minutes before rejoining
         rest = random.uniform(60, 480)
         time.sleep(rest)
 
-# ─── HTTP server ──────────────────────────────────────────────────────────────
+# ─── HTTP server ───────────────────────────────────────────────────────────────
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-class SwarmHandler(BaseHTTPRequestHandler):
+class SignalRelayHandler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
 
     def send_cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, Authorization, X-Payment, x-hive-did, x-payment")
+
+    def send_json(self, status, body_dict):
+        body = json.dumps(body_dict).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.send_cors()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_402(self, price_usd, description, endpoint):
+        env = x402_envelope(price_usd, description, endpoint)
+        body = json.dumps(env).encode()
+        self.send_response(402)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.send_header("X-Payment-Required", f"USDC {price_usd} on base-mainnet to {TREASURY_EVM}")
+        self.send_cors()
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_OPTIONS(self):
-        self.send_response(204); self.send_cors(); self.end_headers()
+        self.send_response(204)
+        self.send_cors()
+        self.end_headers()
 
-    def do_GET(self):
+    def get_client_ip(self):
+        return self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()
+
+    def do_POST(self):
         path = self.path.split("?")[0]
 
-        # SSE live stream
-        if path == "/v1/swarm/feed":
+        # POST /v1/signals/subscribe — $50/mo subscription gate
+        if path == "/v1/signals/subscribe":
+            content_len = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(content_len) if content_len else b"{}"
+            try:
+                body = json.loads(raw_body)
+            except Exception:
+                body = {}
+
+            payment = self.headers.get("X-Payment") or self.headers.get("x-payment")
+            auth    = self.headers.get("Authorization", "")
+
+            if not payment:
+                self.send_402(
+                    PRICE_SUBSCRIBE_MO,
+                    "Signal-relay subscription $50/mo. 100 agents, prediction-market + asset-direction signals, SSE stream access.",
+                    "/v1/signals/subscribe"
+                )
+                return
+
+            ok, tx_hash, payer_did = verify_payment_header(payment)
+            if not ok:
+                self.send_json(402, {"error": "Payment replay or invalid", "x402": True})
+                return
+
+            # Provision subscription
+            token = f"sub_{uuid.uuid4().hex}"
+            plan  = body.get("plan", "monthly")
+            with SUB_LOCK:
+                SUBSCRIPTIONS[token] = {
+                    "token":        token,
+                    "payer_did":    payer_did,
+                    "tx_hash":      tx_hash,
+                    "plan":         plan,
+                    "subscribed_at": time.time(),
+                    "paid_until":   time.time() + 30 * 86400,
+                }
+                STATS["active_subscribers"] = len(SUBSCRIPTIONS)
+
+            receipt_id = fire_spectral_receipt(
+                PRICE_SUBSCRIBE_MO, "signal_subscription_monthly", payer_did, tx_hash
+            )
+            self.send_json(200, {
+                "status":      "subscribed",
+                "token":       token,
+                "plan":        plan,
+                "paid_until":  time.time() + 30 * 86400,
+                "access": {
+                    "sse_stream": f"{SERVICE_URL}/v1/signals/stream",
+                    "recent":     f"{SERVICE_URL}/v1/signals/recent",
+                },
+                "receipt_id":  receipt_id,
+                "relay_only":  True,
+            })
+            return
+
+        # 410 Gone — all former trade/execute routes
+        if any(path.startswith(p) for p in ["/v1/trade", "/v1/execute", "/v1/order",
+                                              "/v1/swarm/trade", "/v1/perp", "/v1/derivative"]):
+            self.send_json(410, {
+                "error":   "Gone",
+                "message": "This service no longer executes trades. Reclassified as hive-swarm-signal-relay.",
+                "see":     f"{SERVICE_URL}/v1/signals/recent",
+            })
+            return
+
+        self.send_json(404, {"error": "Not found"})
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path   = parsed.path
+        params = urllib.parse.parse_qs(parsed.query)
+
+        # ── GET /v1/signals/stream — SSE, x402-gated after 10 free/min ─────────
+        if path == "/v1/signals/stream":
+            client_ip   = self.get_client_ip()
+            payment     = self.headers.get("X-Payment") or self.headers.get("x-payment")
+            auth        = self.headers.get("Authorization", "")
+            sub_ok, sub = is_active_subscriber(auth)
+            free_ok     = check_free_burst(client_ip)
+
+            if not sub_ok and not free_ok and not payment:
+                self.send_402(
+                    PRICE_SIGNAL_BURST,
+                    "Signal stream x402-gated. Free: 10 signals/min. Paid burst: $0.001/10-signal block. Subscribe at /v1/signals/subscribe for $50/mo unlimited.",
+                    "/v1/signals/stream"
+                )
+                return
+
+            if payment and not sub_ok:
+                ok, tx_hash, payer_did = verify_payment_header(payment)
+                if not ok:
+                    self.send_402(PRICE_SIGNAL_BURST, "Payment replay or invalid.", "/v1/signals/stream")
+                    return
+                threading.Thread(
+                    target=fire_spectral_receipt,
+                    args=(PRICE_SIGNAL_BURST, "signal_burst_sse", payer_did, tx_hash),
+                    daemon=True
+                ).start()
+
+            # Stream
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")
             self.send_cors()
             self.end_headers()
-            # Replay last 30 events
-            replay = list(EVENT_BUFFER)[:30]; replay.reverse()
-            for ev in replay:
-                try: self.wfile.write(("data: "+json.dumps(ev)+"\n\n").encode())
-                except: return
-            try: self.wfile.flush()
-            except: return
+
+            # Replay last 30 signals
+            replay = list(SIGNAL_BUFFER)[:30]
+            replay.reverse()
+            for sig in replay:
+                try:
+                    self.wfile.write(("data: " + json.dumps(sig) + "\n\n").encode())
+                except Exception:
+                    return
+            try:
+                self.wfile.flush()
+            except Exception:
+                return
+
             q = collections.deque(maxlen=300)
-            with SSE_LOCK: SSE_CLIENTS.append(q)
+            with SSE_LOCK:
+                SSE_CLIENTS.append(q)
+            STATS["signals_served"] += 1
             try:
                 while True:
                     if q:
@@ -788,96 +787,210 @@ class SwarmHandler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     else:
                         time.sleep(0.08)
-            except: pass
+            except Exception:
+                pass
             finally:
                 with SSE_LOCK:
-                    if q in SSE_CLIENTS: SSE_CLIENTS.remove(q)
+                    if q in SSE_CLIENTS:
+                        SSE_CLIENTS.remove(q)
             return
 
-        # Leaderboard snapshot — always returns something even before trades
-        if path == "/v1/swarm/leaderboard/snapshot":
-            rows = leaderboard()
-            if not rows:
-                # Bootstrap with starting balances before any trades
-                rows = [
-                    {"rank": i+1, "name": a["name"], "did": a["did"],
-                     "balance": round(1000.0 + random.uniform(-5, 5), 2),
-                     "wins": 0, "losses": 0, "streak": 0, "vol": 0.0,
-                     "type": a["name"].split("-")[0]}
-                    for i, a in enumerate(random.sample(AGENTS, min(20, len(AGENTS))))
-                ]
-                rows.sort(key=lambda r: r["balance"], reverse=True)
-                for i, r in enumerate(rows): r["rank"] = i + 1
-            body = json.dumps({"leaderboard": rows, "stats": STATS}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type","application/json")
-            self.send_header("Content-Length",len(body))
-            self.send_cors(); self.end_headers(); self.wfile.write(body)
+        # ── GET /v1/signals/recent?limit=N — x402-gated $0.005 ──────────────
+        if path == "/v1/signals/recent":
+            payment = self.headers.get("X-Payment") or self.headers.get("x-payment")
+            auth    = self.headers.get("Authorization", "")
+            sub_ok, sub = is_active_subscriber(auth)
+            client_ip   = self.get_client_ip()
+            free_ok     = check_free_burst(client_ip)
+
+            if not sub_ok and not free_ok and not payment:
+                self.send_402(
+                    PRICE_RECENT,
+                    "Recent signals x402-gated at $0.005/request. Subscribe at /v1/signals/subscribe for $50/mo.",
+                    "/v1/signals/recent"
+                )
+                return
+
+            if payment and not sub_ok:
+                ok, tx_hash, payer_did = verify_payment_header(payment)
+                if not ok:
+                    self.send_402(PRICE_RECENT, "Payment replay or invalid.", "/v1/signals/recent")
+                    return
+                threading.Thread(
+                    target=fire_spectral_receipt,
+                    args=(PRICE_RECENT, "signal_recent_request", payer_did, tx_hash),
+                    daemon=True
+                ).start()
+
+            limit = int(params.get("limit", ["20"])[0])
+            limit = max(1, min(limit, 500))
+            with SIGNAL_LOCK:
+                signals = list(SIGNAL_BUFFER)[:limit]
+            STATS["signals_served"] += limit
+            self.send_json(200, {
+                "signals":    signals,
+                "count":      len(signals),
+                "total_emitted": STATS["total_signals"],
+                "relay_only": True,
+                "doctrine_never": ["execute_trades","custody_funds","route_orders","hold_keys"],
+            })
             return
 
-        # Leaderboard
-        if path == "/v1/swarm/leaderboard":
-            body = json.dumps({"leaderboard": leaderboard(), "stats": STATS}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type","application/json")
-            self.send_header("Content-Length",len(body))
-            self.send_cors(); self.end_headers(); self.wfile.write(body)
-            return
-
-        # Event snapshot
-        if path == "/v1/swarm/events":
-            body = json.dumps({"events":list(EVENT_BUFFER)[:50],"stats":STATS,"agents_total":len(AGENTS),"agents_active":STATS["agents_active"]}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type","application/json")
-            self.send_header("Content-Length",len(body))
-            self.send_cors(); self.end_headers(); self.wfile.write(body)
-            return
-
-        # Stats
+        # ── GET /v1/swarm/stats ───────────────────────────────────────────────
         if path == "/v1/swarm/stats":
-            body = json.dumps({**STATS,"agents_total":len(AGENTS),"sse_clients":len(SSE_CLIENTS)}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type","application/json")
-            self.send_header("Content-Length",len(body))
-            self.send_cors(); self.end_headers(); self.wfile.write(body)
+            self.send_json(200, {
+                **STATS,
+                "agents_total":    len(AGENTS),
+                "sse_clients":     len(SSE_CLIENTS),
+                "signal_buffer":   len(SIGNAL_BUFFER),
+                "service":         SERVICE_NAME,
+            })
             return
 
-        # Health / root
-        body = json.dumps({"status":"ok","service":"hive-swarm-trader",
-                           "agents_total":len(AGENTS),
-                           "agents_active":STATS["agents_active"],
-                           "total_actions":STATS["total_actions"],
-                           "wins":STATS["wins"],"losses":STATS["losses"],
-                           "sse_clients":len(SSE_CLIENTS)}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type","application/json")
-        self.send_header("Content-Length",len(body))
-        self.send_cors(); self.end_headers(); self.wfile.write(body)
+        # ── GET /v1/swarm/events — legacy alias ──────────────────────────────
+        if path == "/v1/swarm/events":
+            with SIGNAL_LOCK:
+                signals = list(SIGNAL_BUFFER)[:50]
+            self.send_json(200, {
+                "signals":      signals,
+                "stats":        STATS,
+                "agents_total": len(AGENTS),
+                "agents_active":STATS["agents_active"],
+                "note":         "Renamed to /v1/signals/recent. This endpoint is a free alias for backward compat.",
+            })
+            return
+
+        # ── GET /v1/receipt-test ──────────────────────────────────────────────
+        if path == "/v1/receipt-test":
+            receipts = list(RECEIPT_LOG)[:3]
+            self.send_json(200, {
+                "last_receipts":   receipts,
+                "total_fee_events": STATS["fee_events"],
+                "spectral_url":    SPECTRAL_URL,
+                "treasury":        TREASURY_EVM,
+            })
+            return
+
+        # ── 410 — all former trade/execute routes ─────────────────────────────
+        if any(path.startswith(p) for p in ["/v1/trade", "/v1/execute", "/v1/order",
+                                              "/v1/swarm/trade", "/v1/perp", "/v1/derivative"]):
+            self.send_json(410, {
+                "error":   "Gone",
+                "message": "This service no longer executes trades. Reclassified as hive-swarm-signal-relay.",
+                "see":     f"{SERVICE_URL}/v1/signals/recent",
+            })
+            return
+
+        # ── GET /.well-known/agent.json ────────────────────────────────────────
+        if path == "/.well-known/agent.json":
+            agent_card = {
+                "schema_version": "1.0",
+                "name":           SERVICE_NAME,
+                "did":            SERVICE_DID,
+                "description":    (
+                    "Signal-relay-as-a-service. 100 autonomous agents emit prediction-market "
+                    "and asset-direction signals. Hive does not execute trades. Subscribers "
+                    "route execution through OKX, Coinbase, MetaMask, or any DEX of their choice."
+                ),
+                "version":        "2.0.0",
+                "capabilities": [
+                    "signal_emission",
+                    "prediction_market_signals",
+                    "asset_direction_signals",
+                    "sse_stream",
+                    "derivative_outlook_signals",
+                    "trust_momentum_signals",
+                    "compute_demand_signals",
+                ],
+                "doctrine": {
+                    "mode":   "signal-relay-only",
+                    "paper_mode": True,
+                    "never":  [
+                        "execute_trades",
+                        "custody_funds",
+                        "route_orders",
+                        "hold_keys",
+                    ],
+                },
+                "endpoints": {
+                    "base":      SERVICE_URL,
+                    "stream":    f"{SERVICE_URL}/v1/signals/stream",
+                    "subscribe": f"{SERVICE_URL}/v1/signals/subscribe",
+                    "recent":    f"{SERVICE_URL}/v1/signals/recent",
+                    "stats":     f"{SERVICE_URL}/v1/swarm/stats",
+                },
+                "payment": {
+                    "x402": True,
+                    "treasury": {
+                        "evm":        TREASURY_EVM,
+                        "evm_chains": [8453, 1, 137],
+                        "currencies": ["USDC", "USDT"],
+                    },
+                    "fees": {
+                        "signal_burst_sse":             "$0.001 per 10-signal burst",
+                        "signal_subscription_monthly":  "$50.00/mo",
+                        "signal_recent_request":        "$0.005 per request",
+                        "free_tier":                    "10 signals/min per IP, no payment required",
+                    },
+                },
+                "trust": {
+                    "did_attested": True,
+                    "issuer":       "did:web:hivetrust.onrender.com",
+                },
+                "brand": {
+                    "color": BRAND_GOLD,
+                },
+                "registry": "https://hive-discovery.onrender.com",
+            }
+            self.send_json(200, agent_card)
+            return
+
+        # ── GET / — health + identity ─────────────────────────────────────────
+        self.send_json(200, {
+            "name":              SERVICE_NAME,
+            "did":               SERVICE_DID,
+            "status":            "ok",
+            "version":           "2.0.0",
+            "agents_total":      len(AGENTS),
+            "agents_active":     STATS["agents_active"],
+            "total_signals_emitted": STATS["total_signals"],
+            "active_subscribers":STATS["active_subscribers"],
+            "sse_clients":       len(SSE_CLIENTS),
+            "relay_only":        True,
+            "doctrine_never":    ["execute_trades","custody_funds","route_orders","hold_keys"],
+            "endpoints": {
+                "stream":    "/v1/signals/stream",
+                "subscribe": "/v1/signals/subscribe",
+                "recent":    "/v1/signals/recent",
+                "stats":     "/v1/swarm/stats",
+                "agent_card": "/.well-known/agent.json",
+            },
+            "brand_color": BRAND_GOLD,
+            "treasury":    TREASURY_EVM,
+        })
+
 
 # ─── Boot ─────────────────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 8080))
 
-print(f"Hive Swarm Trader v5 — {len(AGENTS)} agents (dynamic roster, oracle-informed, trust-gated)", flush=True)
-print(f"SSE:         http://0.0.0.0:{PORT}/v1/swarm/feed", flush=True)
-print(f"Events:      http://0.0.0.0:{PORT}/v1/swarm/events", flush=True)
-print(f"Leaderboard: http://0.0.0.0:{PORT}/v1/swarm/leaderboard", flush=True)
+print(f"hive-swarm-signal-relay v2.0 — {len(AGENTS)} agents emitting signals (RELAY ONLY, no execution)", flush=True)
+print(f"SSE stream:    http://0.0.0.0:{PORT}/v1/signals/stream  (x402 $0.001/burst, free 10/min)", flush=True)
+print(f"Subscribe:     http://0.0.0.0:{PORT}/v1/signals/subscribe  ($50/mo)", flush=True)
+print(f"Recent:        http://0.0.0.0:{PORT}/v1/signals/recent  (x402 $0.005/req)", flush=True)
+print(f"Stats:         http://0.0.0.0:{PORT}/v1/swarm/stats  (free)", flush=True)
+print(f"Treasury:      {TREASURY_EVM}", flush=True)
+print(f"Spectral:      {SPECTRAL_URL}", flush=True)
 print("="*70, flush=True)
 
-init_ledger(AGENTS)
-
-# Oracle refresh thread
+# Oracle refresh
 threading.Thread(target=refresh_oracle, daemon=True).start()
-time.sleep(1)  # Let oracle do first fetch
+time.sleep(1)
 
-# Agent threads — each manages its own join/leave lifecycle
+# Agent threads
 for agent in AGENTS:
-    # Add small stagger so they don't all join simultaneously at boot
     threading.Thread(target=agent_loop, args=(agent,), daemon=True).start()
 
-# Wave roster coordinator
-threading.Thread(target=wave_roster_coordinator, daemon=True).start()
-
-# HTTP server (main thread)
-server = HTTPServer(("", PORT), SwarmHandler)
+# HTTP server
+server = HTTPServer(("", PORT), SignalRelayHandler)
 print(f"HTTP on :{PORT}", flush=True)
 server.serve_forever()

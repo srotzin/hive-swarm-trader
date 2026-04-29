@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: hive-swarm-signal-relay
+    env: python
+    plan: starter
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PORT
+        value: "8080"
